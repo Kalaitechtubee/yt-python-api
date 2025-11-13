@@ -242,6 +242,8 @@ def download_video():
         ydl_opts.update({
             'outtmpl': os.path.join(TEMP_DOWNLOAD_PATH, f'{temp_filename}.%(ext)s'),
             'noplaylist': True,
+            'no_color': True,
+            'age_limit': None,  # Bypass age restrictions
         })
 
         if download_type == "audio":
@@ -255,23 +257,18 @@ def download_video():
             })
             expected_ext = 'mp3'
         else:
-            # Video format selection
+            # Simplified video format selection for better compatibility
             if quality == "highest":
-                ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+                ydl_opts['format'] = 'best'
             elif quality == "high":
-                ydl_opts['format'] = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]'
+                ydl_opts['format'] = 'best[height<=720]'
             elif quality == "medium":
-                ydl_opts['format'] = 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]'
+                ydl_opts['format'] = 'best[height<=480]'
             elif quality == "lowest":
-                ydl_opts['format'] = 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst'
+                ydl_opts['format'] = 'worst'
             else:
-                ydl_opts['format'] = 'best[ext=mp4]/best'
+                ydl_opts['format'] = 'best'
             
-            # Add postprocessor to merge video and audio
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }]
             expected_ext = 'mp4'
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -328,10 +325,17 @@ def download_video():
         error_msg = str(e)
         print(f"❌ Download Error: {error_msg}")
         
-        if "Sign in" in error_msg or "not available" in error_msg:
-            return jsonify({"error": "Video is unavailable, private, or age-restricted"}), 403
-        
-        return jsonify({"error": f"Download failed: {error_msg}"}), 500
+        # More specific error messages
+        if "Sign in" in error_msg:
+            return jsonify({"error": "This video requires authentication. Please try a different video."}), 403
+        elif "age" in error_msg.lower() or "restricted" in error_msg.lower():
+            return jsonify({"error": "This video is age-restricted and cannot be downloaded."}), 403
+        elif "available" in error_msg.lower():
+            return jsonify({"error": "Video is not available. It may be private or deleted."}), 404
+        elif "copyright" in error_msg.lower():
+            return jsonify({"error": "This video has copyright restrictions."}), 403
+        else:
+            return jsonify({"error": f"Download failed. Try a different video or quality setting."}), 500
         
     except Exception as e:
         if temp_file and os.path.exists(temp_file):
