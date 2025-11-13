@@ -6,8 +6,8 @@ import tempfile
 import re
 import shutil
 
-# ✅ Add FFmpeg to PATH
-os.environ["PATH"] += os.pathsep + r"C:\Users\kalai kumar\Downloads\ffmpeg-8.0-essentials_build\ffmpeg-8.0-essentials_build\bin"
+# ✅ Add FFmpeg to PATH (for local development)
+# os.environ["PATH"] += os.pathsep + r"C:\Users\kalai kumar\Downloads\ffmpeg-8.0-essentials_build\ffmpeg-8.0-essentials_build\bin"
 
 app = Flask(__name__)
 CORS(app)
@@ -22,6 +22,28 @@ def sanitize_filename(filename):
 def check_ffmpeg_installed():
     """Check if FFmpeg is available in PATH"""
     return shutil.which("ffmpeg") is not None
+
+def get_ydl_opts_base():
+    """Base yt-dlp options with cookies and user agent"""
+    return {
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': None,  # You can add cookies.txt path here if needed
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+    }
+
+@app.route('/', methods=['GET'])
+def home():
+    """Home endpoint"""
+    return jsonify({
+        "message": "YouTube Downloader API",
+        "endpoints": {
+            "/health": "Health check",
+            "/api/video-info": "Get video information (POST)",
+            "/api/download": "Download video/audio (POST)"
+        }
+    }), 200
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -42,11 +64,11 @@ def get_video_info():
         if not url:
             return jsonify({"success": False, "error": "URL is required"}), 400
 
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
+        ydl_opts = get_ydl_opts_base()
+        ydl_opts.update({
             'extract_flat': False,
-        }
+            'skip_download': True,
+        })
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -78,6 +100,14 @@ def get_video_info():
 
             return jsonify({"success": True, "info": video_info}), 200
 
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        if "Sign in" in error_msg or "cookies" in error_msg:
+            return jsonify({
+                "success": False, 
+                "error": "YouTube authentication required. The video may be age-restricted or region-locked."
+            }), 403
+        return jsonify({"success": False, "error": f"Download error: {error_msg}"}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -100,12 +130,11 @@ def download_video():
 
         temp_filename = f"temp_{os.urandom(8).hex()}"
 
-        ydl_opts = {
+        ydl_opts = get_ydl_opts_base()
+        ydl_opts.update({
             'outtmpl': os.path.join(TEMP_DOWNLOAD_PATH, f'{temp_filename}.%(ext)s'),
-            'quiet': True,
-            'no_warnings': True,
             'noplaylist': True,
-        }
+        })
 
         if download_type == "audio":
             ydl_opts.update({
@@ -113,7 +142,7 @@ def download_video():
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '192' if quality == 'bestaudio' else '128',
+                    'preferredquality': '192' if quality == 'highest' else '128',
                 }],
             })
         else:
@@ -164,6 +193,18 @@ def download_video():
 
         return response
 
+    except yt_dlp.utils.DownloadError as e:
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+        error_msg = str(e)
+        if "Sign in" in error_msg or "cookies" in error_msg:
+            return jsonify({
+                "error": "YouTube authentication required. The video may be age-restricted or region-locked."
+            }), 403
+        return jsonify({"error": f"Download error: {error_msg}"}), 500
     except Exception as e:
         if temp_file and os.path.exists(temp_file):
             try:
@@ -174,7 +215,7 @@ def download_video():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get("X_ZOHO_CATALYST_LISTEN_PORT", 5000))
+    port = int(os.environ.get("PORT", os.environ.get("X_ZOHO_CATALYST_LISTEN_PORT", 5000)))
     print(f"✅ YouTube Downloader Backend running on port {port}")
     print(f"FFmpeg Installed: {check_ffmpeg_installed()}")
     app.run(host='0.0.0.0', port=port, debug=False)
