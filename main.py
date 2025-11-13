@@ -6,6 +6,7 @@ import tempfile
 import re
 import shutil
 import requests
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -16,6 +17,9 @@ YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
 # Temporary download directory
 TEMP_DOWNLOAD_PATH = tempfile.gettempdir()
+
+# Cookie storage (in production, use a file or database)
+COOKIES_FILE = os.path.join(TEMP_DOWNLOAD_PATH, "youtube_cookies.txt")
 
 def sanitize_filename(filename):
     """Remove invalid characters from filename"""
@@ -32,6 +36,7 @@ def extract_video_id(url):
         r'(?:youtu\.be\/)([^&\n?#]+)',
         r'(?:youtube\.com\/embed\/)([^&\n?#]+)',
         r'(?:youtube\.com\/v\/)([^&\n?#]+)',
+        r'(?:youtube\.com\/shorts\/)([^&\n?#]+)',
     ]
     
     for pattern in patterns:
@@ -61,11 +66,9 @@ def get_video_info_from_api(video_id):
                 statistics = item.get('statistics', {})
                 content_details = item.get('contentDetails', {})
                 
-                # Parse duration (ISO 8601 format: PT15M33S)
                 duration_iso = content_details.get('duration', 'PT0S')
                 duration_str = parse_iso_duration(duration_iso)
                 
-                # Format view count
                 views = int(statistics.get('viewCount', 0))
                 if views >= 1_000_000:
                     views_str = f"{views/1_000_000:.1f}M"
@@ -91,8 +94,6 @@ def get_video_info_from_api(video_id):
 
 def parse_iso_duration(duration):
     """Convert ISO 8601 duration to MM:SS format"""
-    import re
-    
     match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration)
     if not match:
         return "0:00"
@@ -105,36 +106,70 @@ def parse_iso_duration(duration):
     return f"{total_minutes}:{seconds:02d}"
 
 def get_ydl_opts_base():
-    """Enhanced yt-dlp options"""
-    return {
+    """Enhanced yt-dlp options with cookie support for ALL videos"""
+    opts = {
         'quiet': True,
         'no_warnings': True,
+        
+        # Multiple user agents for better success rate
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        
+        # Use multiple player clients (CRITICAL for restricted videos)
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
-                'skip': ['dash', 'hls']
+                'player_client': ['android', 'web', 'ios', 'mweb', 'tv_embedded'],
+                'skip': ['hls', 'dash'],
             }
         },
+        
+        # Enhanced headers
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-us,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
         },
+        
+        # Bypass age restrictions and geo-blocking
+        'age_limit': None,
+        'geo_bypass': True,
+        'geo_bypass_country': 'US',
+        
+        # Network settings
+        'retries': 10,
+        'fragment_retries': 10,
+        'skip_unavailable_fragments': True,
+        'socket_timeout': 30,
+        
+        # Use cookies if available (for age-restricted content)
+        'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
     }
+    
+    return opts
 
 @app.route('/', methods=['GET'])
 def home():
     """Home endpoint"""
     return jsonify({
-        "message": "YouTube Downloader API - Official API Integration",
-        "version": "4.0",
+        "message": "YouTube Downloader API - Universal Download Support",
+        "version": "5.0",
         "status": "online",
-        "features": ["YouTube Data API v3", "yt-dlp downloader", "FFmpeg processing"],
+        "features": [
+            "YouTube Data API v3",
+            "yt-dlp downloader",
+            "FFmpeg processing",
+            "Age-restricted videos",
+            "Region-locked content",
+            "Cookie authentication"
+        ],
         "endpoints": {
             "/health": "Health check (GET)",
             "/api/video-info": "Get video information (POST)",
-            "/api/download": "Download video/audio (POST)"
+            "/api/download": "Download video/audio (POST)",
+            "/api/upload-cookies": "Upload YouTube cookies for restricted content (POST)"
         }
     }), 200
 
@@ -146,12 +181,35 @@ def health_check():
         "message": "Backend server is running",
         "ffmpeg": check_ffmpeg_installed(),
         "yt_dlp_version": yt_dlp.version.__version__,
-        "api_configured": bool(YOUTUBE_API_KEY)
+        "api_configured": bool(YOUTUBE_API_KEY),
+        "cookies_available": os.path.exists(COOKIES_FILE)
     }), 200
+
+@app.route('/api/upload-cookies', methods=['POST'])
+def upload_cookies():
+    """Upload YouTube cookies for age-restricted content"""
+    try:
+        data = request.get_json()
+        cookies = data.get('cookies', '')
+        
+        if not cookies:
+            return jsonify({"success": False, "error": "No cookies provided"}), 400
+        
+        # Save cookies to file
+        with open(COOKIES_FILE, 'w') as f:
+            f.write(cookies)
+        
+        return jsonify({
+            "success": True,
+            "message": "Cookies uploaded successfully. You can now download age-restricted videos."
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/video-info', methods=['POST'])
 def get_video_info():
-    """Fetch video metadata using YouTube Data API v3"""
+    """Fetch video metadata using YouTube Data API v3 or yt-dlp"""
     try:
         data = request.get_json()
         url = data.get("url")
@@ -169,15 +227,15 @@ def get_video_info():
         
         print(f"🔍 Fetching info for video ID: {video_id}")
         
-        # Try YouTube Data API first (100% reliable, no restrictions)
+        # Try YouTube Data API first
         video_info = get_video_info_from_api(video_id)
         
         if video_info:
             print(f"✅ Successfully fetched via API: {video_info['title']}")
             return jsonify({"success": True, "info": video_info, "method": "youtube_api"}), 200
         
-        # Fallback to yt-dlp if API fails
-        print("🔄 API failed, trying yt-dlp...")
+        # Fallback to yt-dlp with enhanced options
+        print("🔄 API failed, trying yt-dlp with enhanced settings...")
         ydl_opts = get_ydl_opts_base()
         ydl_opts.update({
             'extract_flat': False,
@@ -212,13 +270,30 @@ def get_video_info():
             print(f"✅ Successfully fetched via yt-dlp: {video_info['title']}")
             return jsonify({"success": True, "info": video_info, "method": "yt_dlp"}), 200
 
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        print(f"❌ Download Error: {error_msg}")
+        
+        if "Sign in" in error_msg or "age" in error_msg.lower():
+            return jsonify({
+                "success": False, 
+                "error": "This video is age-restricted. Please upload YouTube cookies using /api/upload-cookies endpoint.",
+                "requires_cookies": True
+            }), 403
+        elif "available" in error_msg.lower():
+            return jsonify({
+                "success": False,
+                "error": "Video not found or has been removed."
+            }), 404
+        return jsonify({"success": False, "error": f"Error: {error_msg}"}), 500
+        
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
-        return jsonify({"success": False, "error": f"Failed to fetch video info: {str(e)}"}), 500
+        print(f"❌ Unexpected Error: {str(e)}")
+        return jsonify({"success": False, "error": f"Server error: {str(e)}"}), 500
 
 @app.route('/api/download', methods=['POST'])
 def download_video():
-    """Download video/audio and stream it to client"""
+    """Download video/audio with support for ALL video types"""
     temp_file = None
     try:
         if not check_ffmpeg_installed():
@@ -226,7 +301,7 @@ def download_video():
 
         data = request.get_json()
         url = data.get("url")
-        download_type = data.get("type", "video")  # 'video' or 'audio'
+        download_type = data.get("type", "video")
         quality = data.get("quality", "highest")
 
         if not url:
@@ -243,7 +318,6 @@ def download_video():
             'outtmpl': os.path.join(TEMP_DOWNLOAD_PATH, f'{temp_filename}.%(ext)s'),
             'noplaylist': True,
             'no_color': True,
-            'age_limit': None,  # Bypass age restrictions
         })
 
         if download_type == "audio":
@@ -257,7 +331,7 @@ def download_video():
             })
             expected_ext = 'mp3'
         else:
-            # Simplified video format selection for better compatibility
+            # Video format - simplified for better compatibility
             if quality == "highest":
                 ydl_opts['format'] = 'best'
             elif quality == "high":
@@ -279,11 +353,9 @@ def download_video():
         temp_file = os.path.join(TEMP_DOWNLOAD_PATH, f'{temp_filename}.{expected_ext}')
         
         if not os.path.exists(temp_file):
-            # Search for file with any extension
             for f in os.listdir(TEMP_DOWNLOAD_PATH):
                 if f.startswith(temp_filename):
                     temp_file = os.path.join(TEMP_DOWNLOAD_PATH, f)
-                    # Update extension based on actual file
                     expected_ext = f.split('.')[-1]
                     break
 
@@ -325,17 +397,14 @@ def download_video():
         error_msg = str(e)
         print(f"❌ Download Error: {error_msg}")
         
-        # More specific error messages
-        if "Sign in" in error_msg:
-            return jsonify({"error": "This video requires authentication. Please try a different video."}), 403
-        elif "age" in error_msg.lower() or "restricted" in error_msg.lower():
-            return jsonify({"error": "This video is age-restricted and cannot be downloaded."}), 403
+        if "Sign in" in error_msg or "age" in error_msg.lower():
+            return jsonify({
+                "error": "This video is age-restricted. Upload YouTube cookies to download it."
+            }), 403
         elif "available" in error_msg.lower():
-            return jsonify({"error": "Video is not available. It may be private or deleted."}), 404
-        elif "copyright" in error_msg.lower():
-            return jsonify({"error": "This video has copyright restrictions."}), 403
+            return jsonify({"error": "Video is not available or has been removed."}), 404
         else:
-            return jsonify({"error": f"Download failed. Try a different video or quality setting."}), 500
+            return jsonify({"error": f"Download failed. Try a different quality or video."}), 500
         
     except Exception as e:
         if temp_file and os.path.exists(temp_file):
@@ -350,12 +419,17 @@ def download_video():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", os.environ.get("X_ZOHO_CATALYST_LISTEN_PORT", 5000)))
-    print("=" * 60)
-    print("🎬 YouTube Downloader Backend v4.0")
-    print("=" * 60)
-    print(f"🚀 Server running on: http://0.0.0.0:{port}")
+    print("=" * 70)
+    print("🎬 YouTube Downloader Backend v5.0 - UNIVERSAL SUPPORT")
+    print("=" * 70)
+    print(f"🚀 Server: http://0.0.0.0:{port}")
     print(f"🔑 YouTube API: {'✅ Configured' if YOUTUBE_API_KEY else '❌ Not configured'}")
     print(f"🎬 FFmpeg: {'✅ Available' if check_ffmpeg_installed() else '❌ Not found'}")
     print(f"📦 yt-dlp: v{yt_dlp.version.__version__}")
-    print("=" * 60)
+    print(f"🍪 Cookies: {'✅ Available' if os.path.exists(COOKIES_FILE) else '⚠️ Not uploaded (age-restricted videos will fail)'}")
+    print("=" * 70)
+    print("\n📝 To download age-restricted videos:")
+    print("   1. Export your YouTube cookies using 'Get cookies.txt' browser extension")
+    print("   2. POST the cookies to /api/upload-cookies endpoint")
+    print("   3. All restricted videos will now work!\n")
     app.run(host='0.0.0.0', port=port, debug=False)
